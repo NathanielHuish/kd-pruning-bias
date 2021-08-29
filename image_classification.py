@@ -2,6 +2,7 @@ import argparse
 import datetime
 import os
 import time
+import tensorboard_logger
 
 import torch
 from torch import distributed as dist
@@ -19,6 +20,8 @@ from torchdistill.eval.classification import compute_accuracy
 from torchdistill.misc.log import setup_log_file, SmoothedValue, MetricLogger
 from torchdistill.models.official import get_image_classification_model
 from torchdistill.models.registry import get_model
+
+from tensorboard_logger import configure, log_value
 
 logger = def_logger.getChild(__name__)
 
@@ -65,11 +68,12 @@ def train_one_epoch(training_box, device, epoch, log_freq):
         training_box.update_params(loss)
         batch_size = sample_batch.shape[0]
         metric_logger.update(loss=loss.item(), lr=training_box.optimizer.param_groups[0]['lr'])
+        tensorboard_logger.log_value('loss', loss.item(), epoch)
         metric_logger.meters['img/s'].update(batch_size / (time.time() - start_time))
 
 
 @torch.no_grad()
-def evaluate(model, data_loader, device, device_ids, distributed, log_freq=1000, title=None, header='Test:'):
+def evaluate(model, data_loader, device, device_ids, distributed, log_freq=1000, title=None, header='Test:', epoch=None):
     model.to(device)
     if distributed:
         model = DistributedDataParallel(model, device_ids=device_ids)
@@ -97,6 +101,8 @@ def evaluate(model, data_loader, device, device_ids, distributed, log_freq=1000,
     top1_accuracy = metric_logger.acc1.global_avg
     top5_accuracy = metric_logger.acc5.global_avg
     logger.info(' * Acc@1 {:.4f}\tAcc@5 {:.4f}\n'.format(top1_accuracy, top5_accuracy))
+    tensorboard_logger.log_value('test_acc', top1_accuracy, epoch)
+    tensorboard_logger.log_value('test_acc_top5', top5_accuracy, epoch)
     return metric_logger.acc1.global_avg
 
 
@@ -120,7 +126,7 @@ def train(teacher_model, student_model, dataset_dict, ckpt_file_path, device, de
         training_box.pre_process(epoch=epoch)
         train_one_epoch(training_box, device, epoch, log_freq)
         val_top1_accuracy = evaluate(student_model, training_box.val_data_loader, device, device_ids, distributed,
-                                     log_freq=log_freq, header='Validation:')
+                                     log_freq=log_freq, header='Validation:', epoch=epoch)
         if val_top1_accuracy > best_val_top1_accuracy and is_main_process():
             logger.info('Best top-1 accuracy: {:.4f} -> {:.4f}'.format(best_val_top1_accuracy, val_top1_accuracy))
             logger.info('Updating ckpt at {}'.format(ckpt_file_path))
@@ -142,6 +148,10 @@ def main(args):
     log_file_path = args.log
     if is_main_process() and log_file_path is not None:
         setup_log_file(os.path.expanduser(log_file_path))
+        tensorboard_log_dir = os.path.join('./saved/log/tensorboard/' + args.config.split('/')[-1] + '_' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        if not os.path.isdir(tensorboard_log_dir):
+            os.makedirs(tensorboard_log_dir)
+        tensorboard_logger.configure(tensorboard_log_dir)  
 
     distributed, device_ids = init_distributed_mode(args.world_size, args.dist_url)
     logger.info(args)
