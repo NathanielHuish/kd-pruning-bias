@@ -1,4 +1,9 @@
 data/
+saved/
+imagenet/
+resource/
+imagenet_1gpu
+imagenet.zip
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

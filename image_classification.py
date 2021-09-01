@@ -22,6 +22,10 @@ from torchdistill.models.official import get_image_classification_model
 from torchdistill.models.registry import get_model
 
 from tensorboard_logger import configure, log_value
+import torch.nn.utils.prune as prune
+import torch.nn as nn
+from src.prune_scheduler import AgpPruningRate
+import torchvision.models as models
 
 logger = def_logger.getChild(__name__)
 
@@ -45,13 +49,17 @@ def get_argparser():
 
 
 def load_model(model_config, device, distributed, sync_bn):
-    model = get_image_classification_model(model_config, distributed, sync_bn)
-    if model is None:
-        repo_or_dir = model_config.get('repo_or_dir', None)
-        model = get_model(model_config['name'], repo_or_dir, **model_config['params'])
+    if 'use_torch_pretrained' in model_config.get('params', None):
+        if 'resnet34' in model_config['name']:    
+            model = models.resnet34(pretrained=True)  
+    else:
+        model = get_image_classification_model(model_config, distributed, sync_bn)
+        if model is None:
+            repo_or_dir = model_config.get('repo_or_dir', None)
+            model = get_model(model_config['name'], repo_or_dir, **model_config['params'])
 
-    ckpt_file_path = model_config['ckpt']
-    load_ckpt(ckpt_file_path, model=model, strict=True)
+        ckpt_file_path = model_config['ckpt']
+        load_ckpt(ckpt_file_path, model=model, strict=True)
     return model.to(device)
 
 
@@ -121,9 +129,46 @@ def train(teacher_model, student_model, dataset_dict, ckpt_file_path, device, de
 
     log_freq = train_config['log_freq']
     student_model_without_ddp = student_model.module if module_util.check_if_wrapped(student_model) else student_model
+
+    if config['prune']:
+        want_to_prune = True
+        print('pruning true')
+        prune_config = config['prune']
+        freq = prune_config['freq']
+        prune_end = int(training_box.num_epochs * 0.75)
+        prune_sch = AgpPruningRate(.05, prune_config['target_sparsity'], 1, prune_end, freq)
+        if teacher_model is None:
+            prune_layers = [module for module in training_box.model.modules()][:-1]
+        else:
+            prune_layers = [module for module in training_box.student_model.modules()][:-1]
+
     start_time = time.time()
     for epoch in range(args.start_epoch, training_box.num_epochs):
         training_box.pre_process(epoch=epoch)
+
+        if want_to_prune:
+            if epoch % freq == 1 and epoch <= prune_end:
+                target = prune_sch.step(epoch)
+                print(target)
+                print(f'pruning {target * 100}% sparsity')
+                if epoch > 1 and epoch < prune_end:
+                    for i, layer in enumerate(prune_layers):
+                        if type(layer) == nn.Conv2d or type(layer) == nn.Linear:
+                            prune.remove(layer, "weight")
+                for i, layer in enumerate(prune_layers):
+                    if type(layer) == nn.Conv2d or type(layer) == nn.Linear:
+                        if "struct" in prune_config['strat']:
+                            prune.ln_structured(layer, name="weight",
+                                            amount=float(target), n=1, dim=0)
+                        elif 'finegrain' in prune_config['strat']:
+                            prune.l1_unstructured(layer, name='weight',
+                                              amount=float(target))
+                        layer_spar = float(torch.sum(layer.weight == 0))
+                        layer_spar /= float(layer.weight.nelement())
+                        print(f"Sparsity in layer {i} {type(layer)} {layer_spar: 3f}")
+            elif epoch > prune_end:
+                print("All done pruning")
+
         train_one_epoch(training_box, device, epoch, log_freq)
         val_top1_accuracy = evaluate(student_model, training_box.val_data_loader, device, device_ids, distributed,
                                      log_freq=log_freq, header='Validation:', epoch=epoch)
