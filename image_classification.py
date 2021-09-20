@@ -21,11 +21,14 @@ from torchdistill.misc.log import setup_log_file, SmoothedValue, MetricLogger
 from torchdistill.models.official import get_image_classification_model
 from torchdistill.models.registry import get_model
 
-from tensorboard_logger import configure, log_value
 import torch.nn.utils.prune as prune
 import torch.nn as nn
 from src.prune_scheduler import AgpPruningRate
 import torchvision.models as models
+from torchdistill.datasets.util import build_data_loaders
+from ax.service.managed_loop import optimize
+from ax.utils.tutorials.cnn_utils import train as ax_train
+from ax.utils.tutorials.cnn_utils import evaluate as ax_evaluate
 
 logger = def_logger.getChild(__name__)
 
@@ -109,8 +112,9 @@ def evaluate(model, data_loader, device, device_ids, distributed, log_freq=1000,
     top1_accuracy = metric_logger.acc1.global_avg
     top5_accuracy = metric_logger.acc5.global_avg
     logger.info(' * Acc@1 {:.4f}\tAcc@5 {:.4f}\n'.format(top1_accuracy, top5_accuracy))
-    tensorboard_logger.log_value('test_acc', top1_accuracy, epoch)
-    tensorboard_logger.log_value('test_acc_top5', top5_accuracy, epoch)
+    if epoch is not None:
+        tensorboard_logger.log_value('test_acc', top1_accuracy, epoch)
+        tensorboard_logger.log_value('test_acc_top5', top5_accuracy, epoch)
     return metric_logger.acc1.global_avg
 
 
@@ -130,7 +134,7 @@ def train(teacher_model, student_model, dataset_dict, ckpt_file_path, device, de
     log_freq = train_config['log_freq']
     student_model_without_ddp = student_model.module if module_util.check_if_wrapped(student_model) else student_model
 
-    if config['prune']:
+    if 'prune' in config:
         want_to_prune = True
         print('pruning true')
         prune_config = config['prune']
@@ -141,6 +145,8 @@ def train(teacher_model, student_model, dataset_dict, ckpt_file_path, device, de
             prune_layers = [module for module in training_box.model.modules()][:-1]
         else:
             prune_layers = [module for module in training_box.student_model.modules()][:-1]
+    else:
+        want_to_prune = False
 
     start_time = time.time()
     for epoch in range(args.start_epoch, training_box.num_epochs):
@@ -193,16 +199,31 @@ def main(args):
     log_file_path = args.log
     if is_main_process() and log_file_path is not None:
         setup_log_file(os.path.expanduser(log_file_path))
-        tensorboard_log_dir = os.path.join('./saved/log/tensorboard/' + args.config.split('/')[-1] + '_' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
-        if not os.path.isdir(tensorboard_log_dir):
-            os.makedirs(tensorboard_log_dir)
-        tensorboard_logger.configure(tensorboard_log_dir)  
+    elif is_main_process():
+        setup_tensorboard_dir = True
 
     distributed, device_ids = init_distributed_mode(args.world_size, args.dist_url)
     logger.info(args)
     cudnn.benchmark = True
     set_seed(args.seed)
     config = yaml_util.load_yaml_file(os.path.expanduser(args.config))
+
+    if setup_tensorboard_dir:
+        if 'prune' in config: 
+            prune_config = config['prune']
+            ts = prune_config['target_sparsity']
+        else:
+            ts = 'no_pruning'
+
+        train_config = config['train']
+        optim_config = train_config['optimizer']
+        optim_params = optim_config['params']
+
+        tensorboard_log_dir = os.path.join('./saved/tensorboard/' + args.config.split('/')[-1] + '_ts:' + str(ts) + '_lr:' + str(optim_params['lr']) + '_momentum:' + str(optim_params['momentum']) + '_wd:' + str(optim_params['weight_decay']) + '_' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        if not os.path.isdir(tensorboard_log_dir):
+            os.makedirs(tensorboard_log_dir)
+        tensorboard_logger.configure(tensorboard_log_dir)
+
     device = torch.device(args.device)
     dataset_dict = util.get_all_datasets(config['datasets'])
     models_config = config['models']
@@ -213,6 +234,7 @@ def main(args):
         models_config['student_model'] if 'student_model' in models_config else models_config['model']
     ckpt_file_path = student_model_config['ckpt']
     student_model = load_model(student_model_config, device, distributed, args.sync_bn)
+    
     if not args.test_only:
         train(teacher_model, student_model, dataset_dict, ckpt_file_path, device, device_ids, distributed, config, args)
         student_model_without_ddp =\
@@ -228,7 +250,6 @@ def main(args):
                  title='[Teacher: {}]'.format(teacher_model_config['name']))
     evaluate(student_model, test_data_loader, device, device_ids, distributed,
              title='[Student: {}]'.format(student_model_config['name']))
-
 
 if __name__ == '__main__':
     argparser = get_argparser()
